@@ -1,4 +1,5 @@
 @dataclass
 class EnvironmentConfig:
     num_agents: int
-    OPEN_CARD_COUNT: bool
+    SEE_CARD_COUNTS: bool
+    RETURN_AS_TENSOR: bool = True
