@@ -1,0 +1,2 @@
+# BSRL
+Agents playing BS
