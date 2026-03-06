@@ -23,8 +23,7 @@ class PassAction:
 
 @dataclass
 class StartClaimAction:
-    """Active player declares what they claim they are playing."""
-    claim_rank: int   # 1-13
+    """Active player declares how many cards they claim to play (rank is determined by the env)."""
     claim_count: int  # 1-4
 
 
@@ -42,6 +41,6 @@ class Event:
 
 
 class Phase(str, Enum):
-    CLAIM = "CLAIM"       # active player chooses claim_rank/claim_count
+    CLAIM = "CLAIM"       # active player chooses claim_count (rank cycles automatically)
     SELECT = "SELECT"     # active player selects k cards sequentially
     CHALLENGE = "CHALLENGE"  # non-active players respond with ChallengeAction or PassAction

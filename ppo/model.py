@@ -1,7 +1,6 @@
 import numpy as np
 import torch.nn as nn
 import torch
-import gymnasium as gym
 
 from torch.distributions import Categorical
 

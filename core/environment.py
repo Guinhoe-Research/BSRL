@@ -5,8 +5,8 @@ from dataclasses import dataclass
 import random
 import torch
 
-from configs import EnvironmentConfig
-from models import (
+from core.configs import EnvironmentConfig
+from core.models import (
     ClaimAction, ChallengeAction, PassAction,
     StartClaimAction, SelectCardAction, Event, Phase,
 )
@@ -92,6 +92,7 @@ class Environment:
 
         # Turn / phase state
         self._turn_idx: int = 0          # index of active player into self.agents
+        self.round: int = 0              # complete turn cycles (CLAIM→SELECT→CHALLENGE→resolve)
         self.phase: Phase = Phase.CLAIM
         self._challenge_queue: List[str] = []   # non-active agents yet to respond
         self._challengers: List[str] = []        # agents that chose to challenge
@@ -100,6 +101,7 @@ class Environment:
         self.discard_pile: List[Tuple[int, int]] = []  # (rank, 1) per card
         self.claim_log: List[Event] = []
         self.events_log: List[Event] = []
+        self._current_claim_rank: int = 1  # cycles 1..13
 
         # Pending card-selection state (active during SELECT)
         self._pending_claim_rank: Optional[int] = None
@@ -119,11 +121,11 @@ class Environment:
                     break
                 self.agent_private_states[aid].add_cards(deck.pop(), 1)
 
-    def reset(self) -> Dict[str, Any]:
+    def reset(self) -> Tuple[Dict[str, Any], dict]:
+        """Reset the environment and return (obs, info) for the first agent."""
         self._init_state()
-        result = self.observe(self.agent_selection)
-        print("reset returning:", type(result))  # debug
-        return result
+        obs = self.observe(self.agent_selection)
+        return obs, self.infos[self.agent_selection]
 
 
     # ---- AEC helpers ----
@@ -133,6 +135,8 @@ class Environment:
 
     def _advance_turn(self) -> None:
         self._turn_idx = (self._turn_idx + 1) % len(self.agents)
+        self._current_claim_rank = (self._current_claim_rank % 13) + 1
+        self.round += 1
         self.phase = Phase.CLAIM
         self._challenge_queue = []
         self._challengers = []
@@ -158,10 +162,36 @@ class Environment:
             self.infos[a],
         )
 
-    def step(self, action) -> None:
+    def tensor_to_action(self, action: torch.Tensor):
+        """Convert a one-hot or index tensor (size 19) to the appropriate action model.
+
+        Layout: [claim_count×4 | select_rank×13 | challenge/pass×2]
+        """
+        if action.dim() == 0:
+            idx = action.item()
+        else:
+            idx = action.argmax().item()
+
+        if 0 <= idx <= 3:
+            return StartClaimAction(claim_count=idx + 1)
+        elif 4 <= idx <= 16:
+            return SelectCardAction(rank_idx=idx - 4)
+        elif idx == 17:
+            return ChallengeAction()
+        elif idx == 18:
+            return PassAction()
+        else:
+            raise ValueError(f"Invalid action index: {idx}")
+
+    def step(self, action: torch.Tensor) -> Tuple[Any, float, bool, bool, dict]:
         """
         Process one action from self.agent_selection, then advance agent_selection.
+        Accepts a tensor (one-hot or scalar index) which is converted to the
+        appropriate action model via tensor_to_action.
+        Returns (obs, reward, terminated, truncated, info) for the next agent.
         """
+        action = self.tensor_to_action(action)
+
         # Reset per-step rewards; cumulative rewards accumulate across the episode.
         self.rewards = {aid: 0.0 for aid in self.agents}
 
@@ -176,12 +206,10 @@ class Environment:
             )
             if not isinstance(action, StartClaimAction):
                 raise ValueError(f"Expected StartClaimAction in CLAIM phase, got {type(action)}")
-            if not (1 <= action.claim_rank <= 13):
-                raise ValueError("claim_rank must be 1..13")
             if not (1 <= action.claim_count <= 4):
                 raise ValueError("claim_count must be 1..4")
 
-            self._pending_claim_rank = action.claim_rank
+            self._pending_claim_rank = self._current_claim_rank
             self._pending_claim_count = action.claim_count
             self._pending_selected_ranks = []
             self._pending_remaining_counts = self.agent_private_states[agent].get_hand_counts()[:]
@@ -237,7 +265,7 @@ class Environment:
                 self._challengers = []
                 self.agent_selection = self._challenge_queue[0]
                 self._accumulate_rewards()
-                return  # agent_selection already updated
+                return self.last()  # agent_selection already updated
 
         # ------------------------------------------------------------------ #
         # CHALLENGE — each non-active agent either challenges or passes       #
@@ -270,7 +298,7 @@ class Environment:
                 if self.agent_private_states[former_active].num_cards() == 0:
                     self._handle_win(former_active)
                     self._accumulate_rewards()
-                    return
+                    return self.last()
 
                 self._advance_turn()
 
@@ -278,6 +306,8 @@ class Environment:
             raise ValueError(f"Unknown phase: {self.phase}")
 
         self._accumulate_rewards()
+        return self.last()
+
 
     # ---- Resolution ----
 
@@ -379,7 +409,9 @@ class Environment:
             "action_mask": self.action_mask(),
             "pile_size": pile_size,
             "last_claim": last_claim,
+            "current_claim_rank": self._current_claim_rank,
             "turn_index": self._turn_idx,
+            "round": self.round,
             "card_counts": card_counts,
         }
 
@@ -391,7 +423,9 @@ class Environment:
                 "hand_counts": torch.tensor(hand_counts, dtype=torch.int64),
                 "action_mask": obs["action_mask"],
                 "pile_size": torch.tensor([pile_size], dtype=torch.int64),
+                "current_claim_rank": torch.tensor([self._current_claim_rank], dtype=torch.int64),
                 "turn_index": torch.tensor([self._turn_idx], dtype=torch.int64),
+                "round": torch.tensor([self.round], dtype=torch.int64),
             }
             if card_counts is not None:
                 obs_t["card_counts"] = torch.tensor(

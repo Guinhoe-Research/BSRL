@@ -1,2 +1,2 @@
 # BSRL
-Agents playing BS
+Agents playing the card game BS
