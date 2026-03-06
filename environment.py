@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional, List, Dict, Tuple, Any
+from dataclasses import dataclass
 import random
 import torch
 
@@ -104,7 +105,7 @@ class Environment:
         self._pending_claim_rank: Optional[int] = None
         self._pending_claim_count: Optional[int] = None
         self._pending_selected_ranks: List[int] = []
-        self._pending_slots: Optional[List[int]] = None
+        self._pending_remaining_counts: Optional[List[int]] = None
 
         self._deal()
         self.agent_selection: str = self.active_agent()
@@ -118,8 +119,12 @@ class Environment:
                     break
                 self.agent_private_states[aid].add_cards(deck.pop(), 1)
 
-    def reset(self) -> None:
+    def reset(self) -> Dict[str, Any]:
         self._init_state()
+        result = self.observe(self.agent_selection)
+        print("reset returning:", type(result))  # debug
+        return result
+
 
     # ---- AEC helpers ----
 
@@ -138,7 +143,7 @@ class Environment:
         self._pending_claim_rank = None
         self._pending_claim_count = None
         self._pending_selected_ranks = []
-        self._pending_slots = None
+        self._pending_remaining_counts = None
 
     # ---- PettingZoo AEC interface ----
 
@@ -179,7 +184,7 @@ class Environment:
             self._pending_claim_rank = action.claim_rank
             self._pending_claim_count = action.claim_count
             self._pending_selected_ranks = []
-            self._pending_slots = self.expanded_hand_slots(agent)
+            self._pending_remaining_counts = self.agent_private_states[agent].get_hand_counts()[:]
             self.phase = Phase.SELECT
 
             self.events_log.append(Event(kind="start_claim", agent_id=agent, payload=action))
@@ -193,16 +198,16 @@ class Environment:
             )
             if not isinstance(action, SelectCardAction):
                 raise ValueError(f"Expected SelectCardAction in SELECT phase, got {type(action)}")
-            if self._pending_slots is None:
+            if self._pending_remaining_counts is None:
                 raise RuntimeError("Pending claim state missing.")
-            if not (0 <= action.slot_idx < 13):
-                raise ValueError("slot_idx must be 0..12")
+            if not (0 <= action.rank_idx < 13):
+                raise ValueError("rank_idx must be 0..12")
 
-            rank = self._pending_slots[action.slot_idx]
-            if rank == -1:
-                raise ValueError("Selected an empty slot.")
+            rank = action.rank_idx + 1
+            if self._pending_remaining_counts[action.rank_idx] <= 0:
+                raise ValueError(f"No cards of rank {rank} remaining.")
 
-            self._pending_slots[action.slot_idx] = -1
+            self._pending_remaining_counts[action.rank_idx] -= 1
             self._pending_selected_ranks.append(rank)
             self.events_log.append(Event(kind="select_card", agent_id=agent, payload=action))
 
@@ -331,26 +336,26 @@ class Environment:
 
     # ---- Observation ----
 
-    def expanded_hand_slots(self, agent_id: str) -> List[int]:
-        """Length-13 list of ranks (1..13) for the agent's hand, padded with -1."""
-        counts = self.agent_private_states[agent_id].get_hand_counts()
-        slots: List[int] = []
-        for rank_idx, c in enumerate(counts):
-            slots.extend([rank_idx + 1] * c)
-        if len(slots) > 13:
-            slots = slots[:13]
-        slots.extend([-1] * (13 - len(slots)))
-        return slots
-
     def selection_action_mask(self) -> List[int]:
-        """1 for selectable slots (only valid during SELECT phase for the active player)."""
-        if self.phase != Phase.SELECT or self._pending_slots is None:
+        """1 for each rank (0-indexed) the agent still has available this SELECT."""
+        if self._pending_remaining_counts is None:
             return [0] * 13
-        return [1 if r != -1 else 0 for r in self._pending_slots]
+        return [1 if c > 0 else 0 for c in self._pending_remaining_counts]
+
+    def action_mask(self) -> torch.Tensor:
+        """Mask of valid actions. Layout: [claim_count×4 | select_rank×13 | challenge×2]"""
+        mask = torch.zeros(19, dtype=torch.int64)
+        if self.phase == Phase.CLAIM:
+            mask[:4] = 1
+        elif self.phase == Phase.SELECT:
+            mask[4:17] = torch.tensor(self.selection_action_mask(), dtype=torch.int64)
+        elif self.phase == Phase.CHALLENGE:
+            mask[17:] = 1
+        return mask
+
 
     def observe(self, agent_id: str) -> Dict[str, Any]:
         hand_counts = self.agent_private_states[agent_id].get_hand_counts()
-        expanded_slots = self.expanded_hand_slots(agent_id)
         last_claim = self.claim_log[-1].payload if self.claim_log else None
         pile_size = len(self.discard_pile)
 
@@ -358,13 +363,20 @@ class Environment:
         if self.see_card_counts:
             card_counts = {aid: self.agent_private_states[aid].num_cards() for aid in self.agents}
 
+        phase_tensor = torch.zeros(3, dtype=torch.int64)
+        if self.phase == Phase.CLAIM:
+            phase_tensor[0] = 1
+        elif self.phase == Phase.SELECT:
+            phase_tensor[1] = 1
+        elif self.phase == Phase.CHALLENGE:
+            phase_tensor[2] = 1
+
         obs = {
-            "phase": self.phase.value,
+            "phase": phase_tensor,
             "agent_selection": self.agent_selection,
             "active_agent": self.active_agent(),
             "hand_counts": hand_counts,
-            "hand_slots": expanded_slots,
-            "selection_mask": self.selection_action_mask(),
+            "action_mask": self.action_mask(),
             "pile_size": pile_size,
             "last_claim": last_claim,
             "turn_index": self._turn_idx,
@@ -377,8 +389,7 @@ class Environment:
                 "agent_selection": obs["agent_selection"],
                 "active_agent": obs["active_agent"],
                 "hand_counts": torch.tensor(hand_counts, dtype=torch.int64),
-                "hand_slots": torch.tensor(expanded_slots, dtype=torch.int64),
-                "selection_mask": torch.tensor(obs["selection_mask"], dtype=torch.int64),
+                "action_mask": obs["action_mask"],
                 "pile_size": torch.tensor([pile_size], dtype=torch.int64),
                 "turn_index": torch.tensor([self._turn_idx], dtype=torch.int64),
             }

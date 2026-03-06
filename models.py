@@ -30,8 +30,8 @@ class StartClaimAction:
 
 @dataclass
 class SelectCardAction:
-    """Active player selects a specific card slot (expanded-hand index)."""
-    slot_idx: int     # 0-12
+    """Active player selects a rank to play one card of."""
+    rank_idx: int     # 0-12 (rank = rank_idx + 1)
 
 
 @dataclass

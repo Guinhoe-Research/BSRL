@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 @dataclass
 class EnvironmentConfig:
     num_agents: int
