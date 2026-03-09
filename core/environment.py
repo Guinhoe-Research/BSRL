@@ -385,52 +385,101 @@ class Environment:
 
 
     def observe(self, agent_id: str) -> Dict[str, Any]:
-        hand_counts = self.agent_private_states[agent_id].get_hand_counts()
-        last_claim = self.claim_log[-1].payload if self.claim_log else None
+        """Build an observation for the given agent.
+
+        When return_as_tensor is True, returns a Gymnasium-style dict:
+            "observation" — flat float tensor the policy network consumes
+            "action_mask" — int tensor of valid actions (size 19)
+            + metadata keys for logging / debugging
+
+        When return_as_tensor is False, returns a plain dict of Python objects.
+        """
+        priv = self.agent_private_states[agent_id]
+        hand_counts = priv.get_hand_counts()
+        last_claim: Optional[ClaimAction] = (
+            self.claim_log[-1].payload if self.claim_log else None
+        )
         pile_size = len(self.discard_pile)
 
-        card_counts = None
+        card_counts: Optional[Dict[str, int]] = None
         if self.see_card_counts:
-            card_counts = {aid: self.agent_private_states[aid].num_cards() for aid in self.agents}
+            card_counts = {
+                aid: self.agent_private_states[aid].num_cards() for aid in self.agents
+            }
 
-        phase_tensor = torch.zeros(3, dtype=torch.int64)
-        if self.phase == Phase.CLAIM:
-            phase_tensor[0] = 1
-        elif self.phase == Phase.SELECT:
-            phase_tensor[1] = 1
-        elif self.phase == Phase.CHALLENGE:
-            phase_tensor[2] = 1
+        if not self.return_as_tensor:
+            return {
+                "hand_counts": hand_counts,
+                "phase": self.phase.value,
+                "action_mask": self.action_mask(),
+                "pile_size": pile_size,
+                "last_claim": last_claim,
+                "current_claim_rank": self._current_claim_rank,
+                "agent_selection": self.agent_selection,
+                "active_agent": self.active_agent(),
+                "turn_index": self._turn_idx,
+                "round": self.round,
+                "card_counts": card_counts,
+            }
 
-        obs = {
-            "phase": phase_tensor,
+        # ---------- tensor observation ----------
+
+        # Phase one-hot [CLAIM, SELECT, CHALLENGE] — (3,)
+        phase_vec = torch.zeros(3, dtype=torch.float32)
+        phase_vec[{Phase.CLAIM: 0, Phase.SELECT: 1, Phase.CHALLENGE: 2}[self.phase]] = 1.0
+
+        # Hand counts per rank (1-13) — (13,)
+        hand_vec = torch.tensor(hand_counts, dtype=torch.float32)
+
+        # Discard pile size (scalar) — (1,)
+        pile_vec = torch.tensor([pile_size], dtype=torch.float32)
+
+        # Claim history as (claimed_rank, claimed_count) pairs — (MAX_CLAIMS, 2) long tensor
+        # Ranks 1-13, counts 1-4; row of [0, 0] = padding. Ordered chronologically.
+        # Max claims = 52 (worst case: every claim is 1 card). Use len(claim_log) for valid length.
+        MAX_CLAIMS = 52
+        claim_seq = torch.zeros(MAX_CLAIMS, 2, dtype=torch.long)
+        for i, event in enumerate(self.claim_log):
+            claim: ClaimAction = event.payload
+            claim_seq[i, 0] = claim.claim[0]  # claimed rank
+            claim_seq[i, 1] = claim.claim[1]  # claimed count
+
+        # Current claim rank normalized to [0, 1] — (1,)
+        claim_rank_vec = torch.tensor([self._current_claim_rank / 13.0], dtype=torch.float32)
+
+        # Last claim rank normalized to [0, 1] — (1,); 0 if no prior claim
+        # Last claim count normalized to [0, 1] — (1,); 0 if no prior claim
+        last_rank_val = last_claim.claim[0] / 13.0 if last_claim is not None else 0.0
+        last_count_val = last_claim.claim[1] / 4.0 if last_claim is not None else 0.0
+        last_claim_vec = torch.tensor([last_rank_val, last_count_val], dtype=torch.float32)
+
+        parts = [
+            phase_vec,           # 3   — current game phase
+            hand_vec,            # 13  — cards in this agent's hand
+            pile_vec,            # 1   — number of cards in the discard pile
+            claim_rank_vec,      # 1   — rank that must be claimed this turn
+            last_claim_vec,      # 2   — rank and count of the most recent claim
+        ]
+
+        # Optional: other agents' card counts — (num_agents,)
+        if card_counts is not None:
+            parts.append(
+                torch.tensor([card_counts[aid] for aid in self.agents], dtype=torch.float32)
+            )
+
+        observation = torch.cat(parts)
+
+        return {
+            # --- policy input ---
+            "observation": observation,
+            "action_mask": self.action_mask(),
+            # Claim history for embedding/LSTM — (52, 2) long tensor
+            # Each row: [claimed_rank, claimed_count]. [0,0] = padding.
+            "claim_seq": claim_seq,
+            # --- game metadata ---
             "agent_selection": self.agent_selection,
             "active_agent": self.active_agent(),
-            "hand_counts": hand_counts,
-            "action_mask": self.action_mask(),
-            "pile_size": pile_size,
-            "last_claim": last_claim,
-            "current_claim_rank": self._current_claim_rank,
             "turn_index": self._turn_idx,
             "round": self.round,
-            "card_counts": card_counts,
+            "discard_pile_size": pile_size,
         }
-
-        if self.return_as_tensor:
-            obs_t: Dict[str, Any] = {
-                "phase": obs["phase"],
-                "agent_selection": obs["agent_selection"],
-                "active_agent": obs["active_agent"],
-                "hand_counts": torch.tensor(hand_counts, dtype=torch.int64),
-                "action_mask": obs["action_mask"],
-                "pile_size": torch.tensor([pile_size], dtype=torch.int64),
-                "current_claim_rank": torch.tensor([self._current_claim_rank], dtype=torch.int64),
-                "turn_index": torch.tensor([self._turn_idx], dtype=torch.int64),
-                "round": torch.tensor([self.round], dtype=torch.int64),
-            }
-            if card_counts is not None:
-                obs_t["card_counts"] = torch.tensor(
-                    [card_counts[aid] for aid in self.agents], dtype=torch.int64
-                )
-            return obs_t
-
-        return obs
