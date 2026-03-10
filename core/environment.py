@@ -162,16 +162,11 @@ class Environment:
             self.infos[a],
         )
 
-    def tensor_to_action(self, action: torch.Tensor):
-        """Convert a one-hot or index tensor (size 19) to the appropriate action model.
+    def _int_to_action(self, idx: int):
+        """Convert a discrete action index to the appropriate action model.
 
         Layout: [claim_count×4 | select_rank×13 | challenge/pass×2]
         """
-        if action.dim() == 0:
-            idx = action.item()
-        else:
-            idx = action.argmax().item()
-
         if 0 <= idx <= 3:
             return StartClaimAction(claim_count=idx + 1)
         elif 4 <= idx <= 16:
@@ -183,14 +178,22 @@ class Environment:
         else:
             raise ValueError(f"Invalid action index: {idx}")
 
-    def step(self, action: torch.Tensor) -> Tuple[Any, float, bool, bool, dict]:
+    def tensor_to_action(self, action: torch.Tensor):
+        """Convert a one-hot or scalar index tensor (size 19) to a discrete action index."""
+        if action.dim() == 0:
+            return int(action.item())
+        return int(action.argmax().item())
+
+    def step(self, action: int | torch.Tensor) -> Tuple[Any, float, bool, bool, dict]:
         """
         Process one action from self.agent_selection, then advance agent_selection.
-        Accepts a tensor (one-hot or scalar index) which is converted to the
-        appropriate action model via tensor_to_action.
+        Accepts a discrete integer action index (Gymnasium-style) or a tensor
+        (one-hot or scalar index), which is converted via tensor_to_action.
         Returns (obs, reward, terminated, truncated, info) for the next agent.
         """
-        action = self.tensor_to_action(action)
+        if isinstance(action, torch.Tensor):
+            action = self.tensor_to_action(action)
+        action = self._int_to_action(action)
 
         # Reset per-step rewards; cumulative rewards accumulate across the episode.
         self.rewards = {aid: 0.0 for aid in self.agents}
