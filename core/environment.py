@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional, List, Dict, Tuple, Any
-from dataclasses import dataclass
+from collections import deque
 import random
 import torch
 
@@ -94,7 +94,7 @@ class Environment:
         self._turn_idx: int = 0          # index of active player into self.agents
         self.round: int = 0              # complete turn cycles (CLAIM→SELECT→CHALLENGE→resolve)
         self.phase: Phase = Phase.CLAIM
-        self._challenge_queue: List[str] = []   # non-active agents yet to respond
+        self._challenge_queue: deque[str] = deque()   # non-active agents yet to respond
         self._challengers: List[str] = []        # agents that chose to challenge
 
         # Piles / logs
@@ -138,7 +138,7 @@ class Environment:
         self._current_claim_rank = (self._current_claim_rank % 13) + 1
         self.round += 1
         self.phase = Phase.CLAIM
-        self._challenge_queue = []
+        self._challenge_queue = deque()
         self._challengers = []
         self._clear_pending()
         self.agent_selection = self.active_agent()
@@ -211,6 +211,11 @@ class Environment:
                 raise ValueError(f"Expected StartClaimAction in CLAIM phase, got {type(action)}")
             if not (1 <= action.claim_count <= 4):
                 raise ValueError("claim_count must be 1..4")
+            hand_size = self.agent_private_states[agent].num_cards()
+            if action.claim_count > hand_size:
+                raise ValueError(
+                    f"claim_count {action.claim_count} exceeds hand size {hand_size}"
+                )
 
             self._pending_claim_rank = self._current_claim_rank
             self._pending_claim_count = action.claim_count
@@ -259,12 +264,15 @@ class Environment:
                 self.claim_log.append(claim_event)
                 self.events_log.append(claim_event)
 
+                # Shaping reward: small bonus for playing cards (reducing hand size)
+                self.rewards[agent] += 0.1 * self._pending_claim_count
+
                 # Transition to CHALLENGE — build queue of all other agents
                 self.phase = Phase.CHALLENGE
                 n = len(self.agents)
-                self._challenge_queue = [
+                self._challenge_queue = deque(
                     self.agents[(self._turn_idx + i) % n] for i in range(1, n)
-                ]
+                )
                 self._challengers = []
                 self.agent_selection = self._challenge_queue[0]
                 self._accumulate_rewards()
@@ -287,7 +295,7 @@ class Environment:
             else:
                 self.events_log.append(Event(kind="pass", agent_id=agent, payload=action))
 
-            self._challenge_queue.pop(0)
+            self._challenge_queue.popleft()
 
             if self._challenge_queue:
                 # More agents still need to respond
@@ -379,7 +387,9 @@ class Environment:
         """Mask of valid actions. Layout: [claim_count×4 | select_rank×13 | challenge×2]"""
         mask = torch.zeros(19, dtype=torch.int64)
         if self.phase == Phase.CLAIM:
-            mask[:4] = 1
+            hand_size = self.agent_private_states[self.agent_selection].num_cards()
+            max_claim = min(4, hand_size)
+            mask[:max_claim] = 1
         elif self.phase == Phase.SELECT:
             mask[4:17] = torch.tensor(self.selection_action_mask(), dtype=torch.int64)
         elif self.phase == Phase.CHALLENGE:
@@ -431,21 +441,21 @@ class Environment:
         phase_vec = torch.zeros(3, dtype=torch.float32)
         phase_vec[{Phase.CLAIM: 0, Phase.SELECT: 1, Phase.CHALLENGE: 2}[self.phase]] = 1.0
 
-        # Hand counts per rank (1-13) — (13,)
-        hand_vec = torch.tensor(hand_counts, dtype=torch.float32)
+        # Hand counts per rank (1-13), normalized by max per rank (4) — (13,)
+        hand_vec = torch.tensor(hand_counts, dtype=torch.float32) / 4.0
 
-        # Discard pile size (scalar) — (1,)
-        pile_vec = torch.tensor([pile_size], dtype=torch.float32)
+        # Discard pile size normalized by deck size (52) — (1,)
+        pile_vec = torch.tensor([pile_size / 52.0], dtype=torch.float32)
 
         # Claim history as (claimed_rank, claimed_count) pairs — (MAX_CLAIMS, 2) long tensor
         # Ranks 1-13, counts 1-4; row of [0, 0] = padding. Ordered chronologically.
         # Max claims = 52 (worst case: every claim is 1 card). Use len(claim_log) for valid length.
         MAX_CLAIMS = 52
-        claim_seq = torch.zeros(MAX_CLAIMS, 2, dtype=torch.long)
+        claim_seq = torch.zeros(MAX_CLAIMS, 2, dtype=torch.float32)
         for i, event in enumerate(self.claim_log):
             claim: ClaimAction = event.payload
-            claim_seq[i, 0] = claim.claim[0]  # claimed rank
-            claim_seq[i, 1] = claim.claim[1]  # claimed count
+            claim_seq[i, 0] = claim.claim[0] / 13.0  # claimed rank normalized
+            claim_seq[i, 1] = claim.claim[1] / 4.0   # claimed count normalized
 
         # Current claim rank normalized to [0, 1] — (1,)
         claim_rank_vec = torch.tensor([self._current_claim_rank / 13.0], dtype=torch.float32)
@@ -467,7 +477,7 @@ class Environment:
         # Optional: other agents' card counts — (num_agents,)
         if card_counts is not None:
             parts.append(
-                torch.tensor([card_counts[aid] for aid in self.agents], dtype=torch.float32)
+                torch.tensor([card_counts[aid] / 52.0 for aid in self.agents], dtype=torch.float32)
             )
 
         observation = torch.cat(parts)
@@ -476,8 +486,8 @@ class Environment:
             # --- policy input ---
             "observation": observation,
             "action_mask": self.action_mask(),
-            # Claim history for embedding/LSTM — (52, 2) long tensor
-            # Each row: [claimed_rank, claimed_count]. [0,0] = padding.
+            # Claim history for embedding/LSTM — (52, 2) float tensor
+            # Each row: [claimed_rank/13, claimed_count/4]. [0,0] = padding.
             "claim_seq": claim_seq,
             # --- game metadata ---
             "agent_selection": self.agent_selection,
