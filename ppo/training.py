@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import torch.nn as nn
 import torch
 
@@ -9,15 +13,15 @@ OBSERVATION_DIM = 22
 ACTION_DIM = 19
 
 NUM_ENVS = 32
-NUM_EPOCHS = 10
-TRAJECTORY_WINDOW = 128
+NUM_EPOCHS = 100
+TRAJECTORY_WINDOW = 256
 
 BATCH_SIZE = 64
 
 CLIP = 0.2
 VF_COEF = 0.5
 ENT_COEF = 0.01
-EPOCHS = 10
+EPOCHS = 100
 MB_SIZE = 256
 
 GAMMA = 0.99
@@ -149,7 +153,8 @@ def obtain_trajectories(env):
     values       = torch.stack(values)         # (T,)
     rewards_buf  = torch.stack(rewards_buf)    # (T,)
     dones        = torch.stack(dones)          # (T,)
-    action_masks = torch.stack(action_masks)  # (T, act_dim)
+    action_masks    = torch.stack(action_masks)     # (T, act_dim)
+    claim_sequences = torch.stack(claim_sequences)  # (T, 52, 2)
 
     # GAE (Generalized Advantage Estimation)
     advantages = torch.zeros(TRAJECTORY_WINDOW, dtype=torch.float32)
@@ -191,18 +196,28 @@ def vec_collection(num_envs):
         v_returns.append(r)
         v_action_masks.append(am)
         v_claim_sequences.append(cs)
+    observations    = torch.stack(v_observations)     # (num_envs, T, obs_dim)
+    actions         = torch.stack(v_actions)          # (num_envs, T)
+    log_probs       = torch.stack(v_log_probs)        # (num_envs, T)
+    values          = torch.stack(v_values)           # (num_envs, T)
+    advantages      = torch.stack(v_advantages)       # (num_envs, T)
+    returns         = torch.stack(v_returns)          # (num_envs, T)
+    action_masks    = torch.stack(v_action_masks)     # (num_envs, T, act_dim)
+    claim_sequences = torch.stack(v_claim_sequences)  # (num_envs, T, 52, 2)
     print("Trajectory collection complete.")
-    print("Observations shape:", torch.stack(v_observations).shape)
-    print("Actions shape:", torch.stack(v_actions).shape)
-    print("Log probs shape:", torch.stack(v_log_probs).shape)
-    print("Values shape:", torch.stack(v_values).shape)
-    print("Advantages shape:", torch.stack(v_advantages).shape)
-    print("Returns shape:", torch.stack(v_returns).shape)
-    print("Action masks shape:", torch.stack(v_action_masks).shape)
-    print("Claim sequences shape:", torch.stack(v_claim_sequences).shape)
-    return v_observations, v_actions, v_log_probs, v_values, v_advantages, v_returns, v_action_masks, v_claim_sequences
+    print("Observations shape:", observations.shape)
+    print("Actions shape:", actions.shape)
+    print("Log probs shape:", log_probs.shape)
+    print("Values shape:", values.shape)
+    print("Advantages shape:", advantages.shape)
+    print("Returns shape:", returns.shape)
+    print("Action masks shape:", action_masks.shape)
+    print("Claim sequences shape:", claim_sequences.shape)
+    return observations, actions, log_probs, values, advantages, returns, action_masks, claim_sequences
 
+losses = []
 for epoch in range(NUM_EPOCHS):
+    print(f"Epoch {epoch + 1}/{NUM_EPOCHS}")
     ### Trajectory Farming
     # Collect trajectories
     observations, actions, log_probs, values, advantages, returns, action_masks, claim_sequences = vec_collection(NUM_ENVS)
@@ -214,7 +229,7 @@ for epoch in range(NUM_EPOCHS):
     advantages = advantages.reshape(-1)
     returns = returns.reshape(-1)
     action_masks = action_masks.reshape(-1, action_masks.size(-1))
-    claim_sequences = claim_sequences.reshape(-1, claim_sequences.size(-1), claim_sequences.size(-1))
+    claim_sequences = claim_sequences.reshape(-1, claim_sequences.size(-2), claim_sequences.size(-1))
     
     for b in range(0, observations.size(0), BATCH_SIZE):
         batch_slice = slice(b, b + BATCH_SIZE)
@@ -228,24 +243,29 @@ for epoch in range(NUM_EPOCHS):
         batch_action_masks = action_masks[batch_slice]
         batch_claim_sequences = claim_sequences[batch_slice]
 
-        n_action, n_log_prob, n_logits = ppomodel.get_action(batch_obs, batch_action_masks)
-        _, value             = ppomodel(batch_obs)
-        print("Log prob:", n_log_prob.size())
-        print("Log probs:", batch_log_probs.size())
+        logits, value = ppomodel(batch_obs, batch_claim_sequences)
+        logits = logits.masked_fill(batch_action_masks == 0, float("-inf"))
+        dist = Categorical(logits=logits)
+        n_log_prob = dist.log_prob(batch_actions)
+        entropy = dist.entropy().mean()
 
-        ratio = n_log_prob.exp() / batch_log_probs.exp()
+        ratio = (n_log_prob - batch_log_probs).exp()
         normalized_advantages = (batch_advantages - batch_advantages.mean()) / (batch_advantages.std() + 1e-8)
         left = ratio * normalized_advantages
         right = torch.clamp(ratio, 1.0 - CLIP, 1.0 + CLIP) * normalized_advantages
         policy_loss = -torch.min(left, right).mean()
 
-        value_loss = criterion(batch_values, batch_returns)
+        value_loss = criterion(value.squeeze(), batch_returns)
 
-        masked_logits = n_logits.masked_fill(batch_action_masks == 0, float("-inf"))
-        true_loss = policy_loss + value_loss * VF_COEF - ENT_COEF * Categorical(logits=masked_logits).entropy().mean()
+        true_loss = policy_loss + VF_COEF * value_loss - ENT_COEF * entropy
 
         optimizer.zero_grad()
         true_loss.backward()
 
         nn.utils.clip_grad_norm_(ppomodel.parameters(), 0.5)
         optimizer.step()
+
+        losses.append(true_loss.item())
+    print(f"Epoch {epoch + 1} - Loss: {true_loss.item():.4f}")
+
+torch.save(ppomodel.state_dict(), "ppo_model_100.pth")

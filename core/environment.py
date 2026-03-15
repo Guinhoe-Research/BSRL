@@ -304,12 +304,12 @@ class Environment:
                 # All agents have responded — resolve then advance turn
                 self._resolve_challenges()
 
-                # Win check: did the claimer empty their hand?
-                former_active = self.active_agent()
-                if self.agent_private_states[former_active].num_cards() == 0:
-                    self._handle_win(former_active)
-                    self._accumulate_rewards()
-                    return self.last()
+                # Win check: any agent with an empty hand wins
+                for aid in self.agents:
+                    if self.agent_private_states[aid].num_cards() == 0:
+                        self._handle_win(aid)
+                        self._accumulate_rewards()
+                        return self.last()
 
                 self._advance_turn()
 
@@ -365,6 +365,7 @@ class Environment:
             self.rewards[claimer_id] -= 1.0
 
         self.discard_pile.clear()
+        self.claim_log.clear()
 
     def _handle_win(self, winner_id: str) -> None:
         self.rewards[winner_id] += 10.0
@@ -452,7 +453,7 @@ class Environment:
         # Max claims = 52 (worst case: every claim is 1 card). Use len(claim_log) for valid length.
         MAX_CLAIMS = 52
         claim_seq = torch.zeros(MAX_CLAIMS, 2, dtype=torch.float32)
-        for i, event in enumerate(self.claim_log):
+        for i, event in enumerate(self.claim_log[-MAX_CLAIMS:]):
             claim: ClaimAction = event.payload
             claim_seq[i, 0] = claim.claim[0] / 13.0  # claimed rank normalized
             claim_seq[i, 1] = claim.claim[1] / 4.0   # claimed count normalized
