@@ -149,6 +149,12 @@ class Environment:
         self._pending_selected_ranks = []
         self._pending_remaining_counts = None
 
+    def _get_round(self) -> int:
+        return self.round
+    
+    def _get_discard_pile(self) -> List[Tuple[int, int]]:
+        return self.discard_pile[:]
+
     # ---- PettingZoo AEC interface ----
 
     def last(self) -> Tuple[Any, float, bool, bool, dict]:
