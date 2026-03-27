@@ -31,47 +31,56 @@ def summarizer(action: int, agent_id: str, current_claim_rank: int) -> str:
     else:
         return f"[UNKNOWN] {agent_id} took unknown action {action}"
 
-def run_one_game(config: EnvironmentConfig = EnvironmentConfig(num_agents=2, SEE_CARD_COUNTS=True), model_path="../outputs/ppo_model_100_32.pth"):
+def run_one_game(config: EnvironmentConfig = EnvironmentConfig(num_agents=3, SEE_CARD_COUNTS=True), model_path="../ppo/ppo_model_100_50.pth"):
     cfg = config
     env = Environment(cfg)
 
     observation, info = env.reset()
     # print(observation)
 
-    model = ActorCritic(obs_dim=22, act_dim=19)
+    model = ActorCritic(
+        obs_dim=20 + cfg.num_agents if cfg.SEE_CARD_COUNTS else 20,
+        act_dim=19,
+        has_encoder=True,
+        encode_claimants=cfg.ENCODE_CLAIMANTS,
+        positional_embeddings=cfg.POSITIONAL_EMBEDDINGS,
+    )
     model.load_state_dict(torch.load(model_path, weights_only=True))
     model.eval()
 
 
-    global_round_index = 1
-    index = 0
+    global_round_index = env._get_round()
+    step_counter = 0
 
-    agent_ids = set([f'agent_{i}' for i in range(cfg.num_agents)])
-    agent_ids.add("GAME_STATE")
     game_eval_data = []
-    current_round_observations = {agent_id: [] for agent_id in agent_ids}
+    current_round_steps = []
 
     while True or global_round_index < 35:
         if global_round_index != env._get_round():
-            # New round, reset current round observations
-            current_round_observations["GAME_STATE"].append({
+            # New round, save current round with game state
+            game_eval_data.append({
                 "round_index": global_round_index,
                 "discard_pile": env._get_discard_pile(),
+                "steps": current_round_steps,
             })
-            game_eval_data.append(current_round_observations)
-            current_round_observations = {agent_id: [] for agent_id in agent_ids}
+            current_round_steps = []
             global_round_index = env._get_round()
 
         state = observation["observation"]
         action_mask = observation["action_mask"]
         claim_sequence = observation["claim_seq"]
-        active_agent_id = observation["active_agent"]
+        active_agent_id = observation["agent_selection"]
         discard_pile_size = observation["discard_pile_size"]
 
         with torch.no_grad():
-            action, log_prob, logits = model.get_action(state, action_mask, claim_sequence)
+            action, log_prob, logits = model.get_action(state.unsqueeze(0), action_mask.unsqueeze(0), claim_sequence.unsqueeze(0))
+            action = action.squeeze(0)
+            log_prob = log_prob.squeeze(0)
+            logits = logits.squeeze(0)
 
         game_state_data = {
+            "step": step_counter,
+            "agent": active_agent_id,
             "state": state.tolist(),
             "action_mask": action_mask.tolist(),
             "claim_sequence": claim_sequence.tolist(),
@@ -81,30 +90,25 @@ def run_one_game(config: EnvironmentConfig = EnvironmentConfig(num_agents=2, SEE
             "logits": logits.tolist(),
             "summary": summarizer(action.item(), active_agent_id, env._current_claim_rank)
         }
-        current_round_observations[active_agent_id].append(game_state_data)
+        current_round_steps.append(game_state_data)
 
         observation, reward, terminated, truncated, info = env.step(action)
-        # print(observation, reward, terminated, truncated, info)
         if terminated or truncated:
             break
-        index += 1
+        step_counter += 1
     return game_eval_data
 
 def main():
     print("Evaluation script")
-    config = EnvironmentConfig(num_agents=2, SEE_CARD_COUNTS=True)
+    config = EnvironmentConfig(num_agents=3, SEE_CARD_COUNTS=True)
 
     eval_data = run_one_game(config)
     print("Evaluation complete. Sample data:")
     for round_data in eval_data[:5]:  # Print first 5 rounds of data
-        for agent_id, observations in round_data.items():
-            print(f"Agent: {agent_id}")
-            for obs in observations:
-                if "summary" in obs:
-                    print(obs["summary"])
-                else:
-                    print(obs)
-            print("-" * 20)
+        print(f"Round {round_data['round_index']}")
+        for step in round_data["steps"]:
+            print(step["summary"])
+        print("-" * 20)
 
     with open("eval_output.json", "w") as f:
         import json
