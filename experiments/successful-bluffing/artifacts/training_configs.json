@@ -1,0 +1,35 @@
+{
+  "environment": {
+    "num_agents": 3,
+    "SEE_CARD_COUNTS": true,
+    "RETURN_AS_TENSOR": true,
+    "ENCODE_CLAIMANTS": true,
+    "POSITIONAL_EMBEDDINGS": true
+  },
+  "reward": {
+    "claim_shaping": 0.1,
+    "challenge_correct": 1.0,
+    "challenge_incorrect": -1.0,
+    "claimer_caught": -1.0,
+    "claimer_survived": 1.0,
+    "truthful_card_bonus": 1.2,
+    "successful_bluff": 2.1,
+    "challenge_cost": 0.1,
+    "win_bonus": 10.0
+  },
+  "training": {
+    "num_envs": 32,
+    "num_epochs": 50,
+    "trajectory_window": 256,
+    "batch_size": 32,
+    "clip": 0.2,
+    "vf_coef": 0.75,
+    "ent_coef": 0.01,
+    "gamma": 0.99,
+    "lam": 0.95,
+    "lr": 0.0003,
+    "max_grad_norm": 0.5,
+    "hidden_dim": 64,
+    "seed": 42
+  }
+}
