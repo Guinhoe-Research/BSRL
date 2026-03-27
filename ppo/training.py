@@ -10,11 +10,10 @@ import torch.nn.functional as F
 
 
 # VARIABLES
-OBSERVATION_DIM = 22
 ACTION_DIM = 19
 
 NUM_ENVS = 32
-NUM_EPOCHS = 25
+NUM_EPOCHS = 50
 TRAJECTORY_WINDOW = 256
 
 BATCH_SIZE = 32
@@ -37,10 +36,18 @@ from ppo.actor_critic_model import ActorCritic
 
 torch.manual_seed(42)
 
-cfg = EnvironmentConfig(num_agents=2, SEE_CARD_COUNTS=True)
+cfg = EnvironmentConfig(num_agents=3, SEE_CARD_COUNTS=True)
 env = Environment(cfg)
 
-ppomodel = ActorCritic(obs_dim=OBSERVATION_DIM, act_dim=ACTION_DIM)
+OBSERVATION_DIM = 20 + cfg.num_agents if cfg.SEE_CARD_COUNTS else 20
+
+ppomodel = ActorCritic(
+    obs_dim=OBSERVATION_DIM,
+    act_dim=ACTION_DIM,
+    has_encoder=True,
+    encode_claimants=cfg.ENCODE_CLAIMANTS,
+    positional_embeddings=cfg.POSITIONAL_EMBEDDINGS,
+)
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(ppomodel.parameters(), lr=3e-4)
 
@@ -61,8 +68,10 @@ def obtain_trajectories(env):
         claim_seqs = obs["claim_seq"]
 
         with torch.no_grad():
-            action, log_prob, _ = ppomodel.get_action(state, action_mask, claim_seqs)
-            _, value         = ppomodel(state)
+            action, log_prob, _ = ppomodel.get_action(state.unsqueeze(0), action_mask.unsqueeze(0), claim_seqs.unsqueeze(0))
+            _, value         = ppomodel(state.unsqueeze(0), claim_seqs.unsqueeze(0))
+            action = action.squeeze(0)
+            log_prob = log_prob.squeeze(0)
 
         observations.append(state)
         actions.append(action)
@@ -95,7 +104,7 @@ def obtain_trajectories(env):
     last_gae = 0.0
 
     with torch.no_grad():
-        _, last_value = ppomodel(obs["observation"])
+        _, last_value = ppomodel(obs["observation"].unsqueeze(0), obs["claim_seq"].unsqueeze(0))
         last_value = last_value.squeeze()
 
     for t in reversed(range(TRAJECTORY_WINDOW)):
@@ -228,4 +237,4 @@ for epoch in range(NUM_EPOCHS):
     print(f"Epoch {epoch + 1} - Policy Loss: {mean_pl:.4f}  Value Loss: {mean_vl:.4f}  Mean Return: {epoch_rewards:.4f}")
 
 torch.save(training_metadata, "ppo_training_metadata.pth")
-torch.save(ppomodel.state_dict(), "ppo_model_100_32.pth")
+torch.save(ppomodel.state_dict(), "ppo_model_100_50.pth")
