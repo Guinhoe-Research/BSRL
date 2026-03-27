@@ -454,15 +454,19 @@ class Environment:
         # Discard pile size normalized by deck size (52) — (1,)
         pile_vec = torch.tensor([pile_size / 52.0], dtype=torch.float32)
 
-        # Claim history as (claimed_rank, claimed_count) pairs — (MAX_CLAIMS, 2) long tensor
-        # Ranks 1-13, counts 1-4; row of [0, 0] = padding. Ordered chronologically.
+        # Claim history as (claimed_rank, claimed_count[, claimant]) pairs
+        # Ranks 1-13, counts 1-4; row of zeros = padding. Ordered chronologically.
         # Max claims = 52 (worst case: every claim is 1 card). Use len(claim_log) for valid length.
         MAX_CLAIMS = 52
-        claim_seq = torch.zeros(MAX_CLAIMS, 2, dtype=torch.float32)
+        claim_dim = 3 if self.config.ENCODE_CLAIMANTS else 2
+        claim_seq = torch.zeros(MAX_CLAIMS, claim_dim, dtype=torch.float32)
         for i, event in enumerate(self.claim_log[-MAX_CLAIMS:]):
             claim: ClaimAction = event.payload
             claim_seq[i, 0] = claim.claim[0] / 13.0  # claimed rank normalized
             claim_seq[i, 1] = claim.claim[1] / 4.0   # claimed count normalized
+            if self.config.ENCODE_CLAIMANTS:
+                agent_idx = self.agents.index(event.agent_id)
+                claim_seq[i, 2] = agent_idx / max(len(self.agents) - 1, 1)  # normalized agent index
 
         # Current claim rank normalized to [0, 1] — (1,)
         claim_rank_vec = torch.tensor([self._current_claim_rank / 13.0], dtype=torch.float32)
@@ -493,8 +497,8 @@ class Environment:
             # --- policy input ---
             "observation": observation,
             "action_mask": self.action_mask(),
-            # Claim history for embedding/LSTM — (52, 2) float tensor
-            # Each row: [claimed_rank/13, claimed_count/4]. [0,0] = padding.
+            # Claim history for embedding/LSTM — (52, claim_dim) float tensor
+            # Each row: [claimed_rank/13, claimed_count/4, (optional) claimant]. Zeros = padding.
             "claim_seq": claim_seq,
             # --- game metadata ---
             "agent_selection": self.agent_selection,
