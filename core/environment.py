@@ -5,7 +5,7 @@ from collections import deque
 import random
 import torch
 
-from core.configs import EnvironmentConfig
+from core.configs import EnvironmentConfig, RewardConfig
 from core.models import (
     ClaimAction, ChallengeAction, PassAction,
     StartClaimAction, SelectCardAction, Event, Phase,
@@ -68,8 +68,9 @@ class Environment:
 
     metadata = {"name": "bs_env_v0"}
 
-    def __init__(self, config: EnvironmentConfig):
+    def __init__(self, config: EnvironmentConfig, reward_config: Optional[RewardConfig] = None):
         self.config = config
+        self.reward_config = reward_config or RewardConfig()
         self.possible_agents: List[str] = [f"agent_{i}" for i in range(config.num_agents)]
         self.see_card_counts = config.SEE_CARD_COUNTS
         self.return_as_tensor = config.RETURN_AS_TENSOR
@@ -271,7 +272,13 @@ class Environment:
                 self.events_log.append(claim_event)
 
                 # Shaping reward: small bonus for playing cards (reducing hand size)
-                self.rewards[agent] += 0.1 * self._pending_claim_count
+                rc = self.reward_config
+                self.rewards[agent] += rc.claim_shaping * self._pending_claim_count
+
+                # Bonus per card that actually matches the required rank
+                if rc.truthful_card_bonus != 0.0:
+                    matching = sum(1 for r in self._pending_selected_ranks if r == self._pending_claim_rank)
+                    self.rewards[agent] += rc.truthful_card_bonus * matching
 
                 # Transition to CHALLENGE — build queue of all other agents
                 self.phase = Phase.CHALLENGE
@@ -339,8 +346,7 @@ class Environment:
           - Claim was untruthful → challengers were right; claimer takes the pile;
                                    challengers get +1 reward, claimer gets -1.
         """
-        if not self._challengers:
-            return  # pile stays, no rewards
+        rc = self.reward_config
 
         last_claim: ClaimAction = self.claim_log[-1].payload
         claimed_rank, claimed_count = last_claim.claim
@@ -348,11 +354,22 @@ class Environment:
         truthful = (len(actual) == claimed_count) and all(r == claimed_rank for r, _ in actual)
         claimer_id = self.claim_log[-1].agent_id
 
+        if not self._challengers:
+            # No challenge — reward successful bluffs
+            if not truthful and rc.successful_bluff != 0.0:
+                self.rewards[claimer_id] += rc.successful_bluff
+            return  # pile stays
+
         self.events_log.append(Event(
             kind="resolve_challenge",
             agent_id=claimer_id,
             payload={"truthful": truthful, "challengers": list(self._challengers)},
         ))
+
+        # Flat cost for every agent that chose to challenge
+        if rc.challenge_cost != 0.0:
+            for challenger in self._challengers:
+                self.rewards[challenger] -= rc.challenge_cost
 
         if truthful:
             # Challengers were wrong — first challenger picks up the pile
@@ -360,21 +377,21 @@ class Environment:
             for r, c in self.discard_pile:
                 self.agent_private_states[loser].add_cards(r, c)
             for challenger in self._challengers:
-                self.rewards[challenger] -= 1.0
-            self.rewards[claimer_id] += 1.0
+                self.rewards[challenger] += rc.challenge_incorrect
+            self.rewards[claimer_id] += rc.claimer_survived
         else:
             # Challengers were right — claimer picks up the pile
             for r, c in self.discard_pile:
                 self.agent_private_states[claimer_id].add_cards(r, c)
             for challenger in self._challengers:
-                self.rewards[challenger] += 1.0
-            self.rewards[claimer_id] -= 1.0
+                self.rewards[challenger] += rc.challenge_correct
+            self.rewards[claimer_id] += rc.claimer_caught
 
         self.discard_pile.clear()
         self.claim_log.clear()
 
     def _handle_win(self, winner_id: str) -> None:
-        self.rewards[winner_id] += 10.0
+        self.rewards[winner_id] += self.reward_config.win_bonus
         self.terminations = {aid: True for aid in self.agents}
         self.agent_selection = winner_id
 
@@ -485,11 +502,13 @@ class Environment:
             last_claim_vec,      # 2   — rank and count of the most recent claim
         ]
 
-        # Optional: other agents' card counts — (num_agents,)
+        # Optional: other agents' card counts — padded to (max_agents,)
         if card_counts is not None:
-            parts.append(
-                torch.tensor([card_counts[aid] / 52.0 for aid in self.agents], dtype=torch.float32)
-            )
+            max_agents = self.config.max_agents or self.config.num_agents
+            counts_vec = torch.zeros(max_agents, dtype=torch.float32)
+            for i, aid in enumerate(self.agents):
+                counts_vec[i] = card_counts[aid] / 52.0
+            parts.append(counts_vec)
 
         observation = torch.cat(parts)
 
