@@ -11,7 +11,7 @@ if str(project_root) not in sys.path:
 	sys.path.append(str(project_root))
      
 from core.environment import Environment
-from core.configs import EnvironmentConfig
+from core.configs import EnvironmentConfig, RewardConfig
 from ppo.actor_critic_model import ActorCritic
 
 torch.manual_seed(505)
@@ -31,9 +31,9 @@ def summarizer(action: int, agent_id: str, current_claim_rank: int) -> str:
     else:
         return f"[UNKNOWN] {agent_id} took unknown action {action}"
 
-def run_one_game(config: EnvironmentConfig = EnvironmentConfig(num_agents=3, SEE_CARD_COUNTS=True), model_path="../ppo/ppo_model_100_50.pth"):
+def run_one_game(config: EnvironmentConfig = EnvironmentConfig(num_agents=3, SEE_CARD_COUNTS=True), reward_config: RewardConfig = RewardConfig(), model_path="../ppo/ppo_model_100_50.pth"):
     cfg = config
-    env = Environment(cfg)
+    env = Environment(cfg, reward_config)
 
     observation, info = env.reset()
     # print(observation)
